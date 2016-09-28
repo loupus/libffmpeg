@@ -5,6 +5,7 @@
 #include "queue.h"
 #include "timer.h"
 #include "video_decoder.h"
+#include "audio_decoder.h"
 #include <memory>
 #include <string>
 #include <thread>
@@ -25,6 +26,7 @@ private:
 private:
 	std::unique_ptr<Demuxer> demuxer_;
 	std::unique_ptr<VideoDecoder> video_decoder_;
+	std::unique_ptr<AudioDecoder> audio_decoder_;
 	std::unique_ptr<FormatConverter> format_converter_;
 	std::unique_ptr<Display> display_;
 	std::unique_ptr<Timer> timer_;
