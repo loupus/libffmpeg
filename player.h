@@ -22,6 +22,7 @@ public:
 private:
 	void demultiplex();
 	void decode_video();
+	void decode_audio(AVPacket* packet);
 	void video();
 private:
 	std::unique_ptr<Demuxer> demuxer_;

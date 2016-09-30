@@ -4,7 +4,7 @@ CXXFLAGS = -g3 -std=c++11 -D__STDC_CONSTANT_MACROS \
 		   -Wdisabled-optimization -Wctor-dtor-privacy -Wmissing-declarations \
 		   -Woverloaded-virtual -Wshadow -Winline
 LDLIBS = -lavformat -lavcodec -lswresample -lswscale -lavutil -lrtmp \
-		 -lssl -lcrypto -lopus -lm -lz -lSDL2 -lpthread
+		 -lssl -lcrypto -lz -lao -lSDL2 -lpthread
 
 src = $(wildcard *.cpp)
 obj = $(src:.cpp=.o)

@@ -11,7 +11,7 @@ inline T check_SDL(T value, const std::string &message) {
 }
 
 SDL::SDL() {
-	check_SDL(!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER), "init");
+	check_SDL(!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER), "init");
 }
 
 SDL::~SDL() {

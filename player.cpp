@@ -3,234 +3,217 @@
 #include <chrono>
 #include <iostream>
 extern "C" {
-	#include <libavutil/time.h>
-	#include <libavutil/imgutils.h>
+    #include <libavutil/time.h>
+    #include <libavutil/imgutils.h>
 }
 
 Player::Player(const std::string &file_name) :
-	demuxer_{new Demuxer{file_name}},
-	video_decoder_{new VideoDecoder{demuxer_->video_codec()}},
-	audio_decoder_{new AudioDecoder{demuxer_->audio_codec()}},
-	/*format_converter_{new FormatConverter{
-						video_decoder_->width(),		\
-						video_decoder_->height(),		\
-						video_decoder_->pixel_format(),	\
-						AV_PIX_FMT_YUV420P				\
-					}},*/
-	display_{new Display{video_decoder_->width(), video_decoder_->height()}},
-	timer_{new Timer}/*,
-	packet_queue_{new PacketQueue{queue_size_}},
-	frame_queue_{new FrameQueue{queue_size_}}*/ {
+    demuxer_{new Demuxer{file_name}},
+    video_decoder_{new VideoDecoder{demuxer_->video_codec()}},
+    audio_decoder_{new AudioDecoder{demuxer_->audio_codec()}},
+    format_converter_{new FormatConverter{
+                        video_decoder_->width(),
+                        video_decoder_->height(),
+                        video_decoder_->pixel_format(),
+                        AV_PIX_FMT_YUV420P
+                     }},
+    display_{new Display{video_decoder_->width(), video_decoder_->height()}},
+    timer_{new Timer},
+    packet_queue_{new PacketQueue{queue_size_}},
+    frame_queue_{new FrameQueue{queue_size_}} {
 }
 
 Player::~Player() {
-	frame_queue_->quit();
-	packet_queue_->quit();
+    frame_queue_->quit();
+    packet_queue_->quit();
 
-	for (auto &stage : stages_) {
-		stage.join();
-	}
+    for (auto &stage : stages_) {
+        stage.join();
+    }
 }
 
 void Player::operator()() {
-	stages_.emplace_back(&Player::demultiplex, this);
-	// stages_.emplace_back(&Player::decode_video, this);
-	video();
+    stages_.emplace_back(&Player::demultiplex, this);
+    stages_.emplace_back(&Player::decode_video, this);
+    video();
 }
-// Move this to VideoDecoder or to Demuxer
+
 void Player::demultiplex() {
-	try {
-		for (;;) {
-			// Create AVPacket
-			std::unique_ptr<AVPacket, std::function<void(AVPacket*)>> packet{
-				new AVPacket, [](AVPacket* p){ av_packet_unref(p); delete p; }};
-			av_init_packet(packet.get());
-			packet->data = nullptr;
+    try {
+        for (;;) {
+            // Create AVPacket
+            std::unique_ptr<AVPacket, std::function<void(AVPacket*)>> packet
+            {
+                new AVPacket,
+                [](AVPacket* p){ av_packet_unref(p); delete p; }
+            };
+            av_init_packet(packet.get());
+            packet->data = nullptr;
 
-			// Read frame into AVPacket
-			if (!(*demuxer_)(*packet)) {
-				packet_queue_->finished();
-				break;
-			}
+            // Read frame into AVPacket
+            if (!(*demuxer_)(*packet)) {
+                packet_queue_->finished();
+                break;
+            }
 
-			// Move into queue if first video stream
-			if (packet->stream_index == demuxer_->get_video_stream_index()) {
-				if (!packet_queue_->push(move(packet))) {
-					break;
-				}
-			}
-		}
-	} catch (std::exception &e) {
-		std::cerr << "Demuxing error: " << e.what() << std::endl;
-		exit(1);
-	}
+            // Move into queue if first video stream
+            if (packet->stream_index == demuxer_->get_video_stream_index()) {
+                if (!packet_queue_->push(move(packet))) {
+                    break;
+                }
+            } else if (packet->stream_index == demuxer_->get_audio_stream_index()) {
+            	decode_audio(packet.get());
+            }
+        }
+    } catch (std::exception &e) {
+        std::cerr << "Demuxing error: " << e.what() << std::endl;
+        exit(1);
+    }
 }
-// Move this to VideoDecoder
-void Player::decode_video() {
-	const AVRational microseconds = {1, 1000000};
 
-	try {
-		for (;;) {
-			// Create AVFrame and AVQueue
-			std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> frame_decoded{
-				av_frame_alloc(), [](AVFrame* f){ av_frame_free(&f); }};
-			std::unique_ptr<AVPacket, std::function<void(AVPacket*)>> packet{
-				nullptr, [](AVPacket* p){ av_packet_unref(p); delete p; }};
+void Player::decode_video()
+{
+    const AVRational microseconds = {1, 1000000};
 
-			// Read packet from queue
-			if (!packet_queue_->pop(packet)) {
-				frame_queue_->finished();
-				break;
-			}
+    try {
+        for (;;) {
+            // Create AVFrame and AVQueue
+            std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> frame_decoded
+            {
+                av_frame_alloc(),
+                [](AVFrame* f){ av_frame_free(&f); }
+            };
+            std::unique_ptr<AVPacket, std::function<void(AVPacket*)>> packet
+            {
+                nullptr,
+                [](AVPacket* p){ av_packet_unref(p); delete p; }
+            };
 
-			// Decode packet
-			int finished_frame;
-			(*video_decoder_)(
-				frame_decoded.get(), finished_frame, packet.get());
+            // Read packet from queue
+            if (!packet_queue_->pop(packet)) {
+                frame_queue_->finished();
+                break;
+            }
 
-			// If a whole frame has been decoded,
-			// adjust time stamps and add to queue
-			if (finished_frame) {
-				frame_decoded->pts = av_rescale_q(
-					frame_decoded->pkt_dts,
-					demuxer_->time_base(),
-					microseconds);
+            // Decode packet
+            int finished_frame;
+            (*video_decoder_)(frame_decoded.get(), finished_frame, packet.get());
 
-				std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> frame_converted{
-					av_frame_alloc(),
-					[](AVFrame* f){ av_free(f->data[0]); }};
-				if (av_frame_copy_props(frame_converted.get(),
-				    frame_decoded.get()) < 0) {
-					throw std::runtime_error("Copying frame properties");
-				}
-				if (av_image_alloc(
-					frame_converted->data, frame_converted->linesize,
-					video_decoder_->width(), video_decoder_->height(),
-					video_decoder_->pixel_format(), 1) < 0) {
-					throw std::runtime_error("Allocating picture");
-				}	
-				(*format_converter_)(
-					frame_decoded.get(), frame_converted.get());
+            // If a whole frame has been decoded,
+            // adjust time stamps and add to queue
+            if (finished_frame) {
+            	int pts = 0;
+            	if (frame_decoded->pkt_dts != AV_NOPTS_VALUE)
+            	{
+            		pts = frame_decoded->pkt_dts;
+            	}
+                frame_decoded->pts = av_rescale_q(
+                    pts,
+                    demuxer_->time_base(),
+                    microseconds);
 
-				if (!frame_queue_->push(move(frame_converted))) {
-					break;
-				}
-			}
-		}
-	} catch (std::exception &e) {
-		std::cerr << "Decoding error: " <<  e.what() << std::endl;
-		exit(1);
-	}
+                std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> frame_converted
+                {
+                    av_frame_alloc(),
+                    [](AVFrame* f){ av_free(f->data[0]); }
+                };
+                if (av_frame_copy_props(frame_converted.get(),
+                    frame_decoded.get()) < 0) {
+                    throw std::runtime_error("Copying frame properties");
+                }
+                if (av_image_alloc(
+                    frame_converted->data, frame_converted->linesize,
+                    video_decoder_->width(), video_decoder_->height(),
+                    video_decoder_->pixel_format(), 1) < 0) {
+                    throw std::runtime_error("Allocating picture");
+                }   
+                (*format_converter_)(frame_decoded.get(), frame_converted.get());
+
+                if (!frame_queue_->push(move(frame_converted))) {
+                    break;
+                }
+            }
+        }
+    } catch (std::exception &e) {
+        std::cerr << "Decoding error: " <<  e.what() << std::endl;
+        exit(1);
+    }
 }
-// Not in use yet
-// Move this to AudioDecoder
-// void Player::decode_audio()
-// {
-// 	const AVRational microseconds = {1, 1000000};
 
-// 	try {
-// 		for (;;) {
-// 			// Create AVFrame and AVQueue
-// 			std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> frame_decoded
-// 			{
-// 				av_frame_alloc(),
-// 				[](AVFrame* f) { av_frame_free(&f); }
-// 			};
-// 			std::unique_ptr<AVPacket, std::function<void(AVPacket*)>> packet
-// 			{
-// 				nullptr,
-// 				[](AVPacket* p) { av_packet_unref(p); delete p; }
-// 			};
+void Player::decode_audio(AVPacket* packet)
+{
+    int plane_size;
 
-// 			// Read packet from queue
-// 			if (!packet_queue_->pop(packet)) {
-// 				frame_queue_->finished();
-// 				break;
-// 			}
+    packet->data = audio_decoder_->buffer;
+    packet->size = audio_decoder_->buffer_size;
 
-// 			// Decode packet
-// 			int finished_frame;
-// 			(*video_decoder_)(
-// 				frame_decoded.get(), finished_frame, packet.get());
+    // Decode packet
+    int finished_frame;
+    (*audio_decoder_)(finished_frame, packet);
 
-// 			// If a whole frame has been decoded,
-// 			// adjust time stamps and add to queue
-// 			if (finished_frame) {
-// 				frame_decoded->pts = av_rescale_q(
-// 					frame_decoded->pkt_dts,
-// 					demuxer_->time_base(),
-// 					microseconds);
+    int data_size = av_samples_get_buffer_size(
+    					&plane_size,
+    					audio_decoder_->get_channels(),
+    					audio_decoder_->frame->nb_samples,
+    					audio_decoder_->sfmt,
+    					1
+    				);
+    if (data_size < 0) {
+    	std::cout << "data_size: " << data_size << std::endl;
+    	throw std::runtime_error("Could not get the required buffer size");
+    }
 
-// 				std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> frame_converted{
-// 					av_frame_alloc(),
-// 					[](AVFrame* f){ av_free(f->data[0]); }};
-// 				if (av_frame_copy_props(frame_converted.get(),
-// 				    frame_decoded.get()) < 0) {
-// 					throw std::runtime_error("Copying frame properties");
-// 				}
-// 				if (av_image_alloc(
-// 					frame_converted->data, frame_converted->linesize,
-// 					video_decoder_->width(), video_decoder_->height(),
-// 					video_decoder_->pixel_format(), 1) < 0) {
-// 					throw std::runtime_error("Allocating picture");
-// 				}	
-// 				(*format_converter_)(
-// 					frame_decoded.get(), frame_converted.get());
+    if (finished_frame) {
+    	audio_decoder_->play(plane_size);
+    } else {
+        throw std::runtime_error("frame failed");
+    }
+}
 
-// 				if (!frame_queue_->push(move(frame_converted))) {
-// 					break;
-// 				}
-// 			}
-// 		}
-// 	} catch (std::exception &e) {
-// 		std::cerr << "Decoding error: " <<  e.what() << std::endl;
-// 		exit(1);
-// 	}
-// }
+void Player::video()
+{
+    try {
+        int64_t last_pts = 0;
 
-void Player::video() {
-	try {
-		video_decoder_->decode_video();
-		int64_t last_pts = 0;
+        for (uint64_t frame_number = 0;; ++frame_number) {
+            display_->input();
 
-		for (uint64_t frame_number = 0;; ++frame_number) {
+            if (display_->get_quit()) {
+                break;
+            } else if (display_->get_play()) {
+                std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> frame
+                {
+                    nullptr,
+                    [](AVFrame* f) { av_frame_free(&f); }
+                };
+                if (!frame_queue_->pop(frame)) {
+                    break;
+                }
 
-			display_->input();
+                if (frame_number) {
+                    const int64_t frame_delay = frame->pts - last_pts;
+                    last_pts = frame->pts;
+                    timer_->wait(frame_delay);
+                } else {
+                    last_pts = frame->pts;
+                    timer_->update();
+                }
 
-			if (display_->get_quit()) {
-				break;
+                display_->refresh(
+                    {frame->data[0], frame->data[1], frame->data[2]},
+                    {static_cast<size_t>(frame->linesize[0]),
+                     static_cast<size_t>(frame->linesize[1]),
+                     static_cast<size_t>(frame->linesize[2])}
+                );
 
-			} else if (display_->get_play()) {
-				std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> frame{
-					nullptr, [](AVFrame* f){ av_frame_free(&f); }};
-				if (!frame_queue_->pop(frame)) {
-					break;
-				}
-
-				if (frame_number) {
-					const int64_t frame_delay = frame->pts - last_pts;
-					last_pts = frame->pts;
-					timer_->wait(frame_delay);
-
-				} else {
-					last_pts = frame->pts;
-					timer_->update();
-				}
-
-				display_->refresh(
-					{frame->data[0], frame->data[1], frame->data[2]},
-					{static_cast<size_t>(frame->linesize[0]),
-					 static_cast<size_t>(frame->linesize[1]),
-					 static_cast<size_t>(frame->linesize[2])});
-
-			} else {
-				std::chrono::milliseconds sleep(10);
-				std::this_thread::sleep_for(sleep);
-				timer_->update();
-			}
-		}
-	} catch (std::exception &e) {
-		std::cerr << "Display error: " <<  e.what() << std::endl;
-		exit(1);
-	}
+            } else {
+                std::chrono::milliseconds sleep(10);
+                std::this_thread::sleep_for(sleep);
+                timer_->update();
+            }
+        }
+    } catch (std::exception &e) {
+        std::cerr << "Display error: " <<  e.what() << std::endl;
+        exit(1);
+    }
 }

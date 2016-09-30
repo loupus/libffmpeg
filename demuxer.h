@@ -8,13 +8,12 @@ class Demuxer {
 public:
 	Demuxer(const std::string &file_name);
 	~Demuxer();
-	AVCodecContext* video_codec();
-	AVCodecContext* audio_codec();
+	AVCodecParameters* video_codec();
+	AVCodecParameters* audio_codec();
 	int get_video_stream_index() const;
 	int get_audio_stream_index() const;
 	AVRational time_base() const;
 	bool operator()(AVPacket &packet);
-
 private:
 	AVFormatContext* avcontainer{};
 	int video_stream_index{};
